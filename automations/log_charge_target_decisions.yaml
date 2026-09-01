@@ -1,0 +1,21 @@
+id: "1788237602412"
+alias: Energy - Log charge target decisions
+description: ""
+triggers:
+  - trigger: state
+    entity_id:
+      - number.alphaess_inverter_charging_cutoff_soc
+conditions: []
+actions:
+  - action: logbook.log
+    metadata: {}
+    data:
+      name: 电池策略
+      message: Charging cutoff SoC set to {{ trigger.to_state.state }}%, previously {{ trigger.from_state.state if trigger.from_state else 'unknown' }}%. Battery now {{ states.sensor.alphaess_inverter_battery_state_of_charge.state }}%. Forecast {{ states.sensor.solcast_pv_forecast_forecast_tomorrow.state }} kWh. Weather {{ states.weather.forecast_wo_de_jia.state }}.
+  - action: input_text.set_value
+    metadata: {}
+    target:
+      entity_id: input_text.last_night_charge_decision
+    data:
+      value: "{{ now().strftime('%Y-%m-%d %H:%M') }} target={{ trigger.to_state.state }}% prev={{ trigger.from_state.state if trigger.from_state else 'NA' }}% batt={{ states.sensor.alphaess_inverter_battery_state_of_charge.state }}% fc={{ states.sensor.solcast_pv_forecast_forecast_tomorrow.state }}kWh wx={{ states.weather.forecast_wo_de_jia.state }}"
+mode: single
