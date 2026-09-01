@@ -1,0 +1,21 @@
+id: "1788238591565"
+alias: Energy - Nightly effect logger
+description: ""
+triggers:
+  - trigger: time
+    at: 07:30:00
+conditions: []
+actions:
+  - action: input_text.set_value
+    metadata: {}
+    target:
+      entity_id: input_text.battery_strategy_effect_summary
+    data:
+      value: "{{ states('input_text.last_night_charge_decision') }} | min_soc={{ states('input_number.overnight_min_battery_soc') }}% | grid_kwh_today={{ states('sensor.alphaess_inverter_today_s_battery_charged_from_grid') }} | note={{ 'LOW: min SOC near floor, consider raising target' if states('input_number.overnight_min_battery_soc')|float(100) <= 13 else ('HIGH: min SOC stayed high, target may be too conservative' if states('input_number.overnight_min_battery_soc')|float(0) >= 30 else 'OK: within normal range') }}"
+  - action: logbook.log
+    metadata: {}
+    data:
+      name: 电池策略效果
+      message: "Overnight min SOC {{ states('input_number.overnight_min_battery_soc') }}%, grid charge today {{ states('sensor.alphaess_inverter_today_s_battery_charged_from_grid') }}kWh. Last night decision: {{ states('input_text.last_night_charge_decision') }}. Assessment: {{ 'LOW - min SOC near floor, consider raising target' if states('input_number.overnight_min_battery_soc')|float(100) <= 13 else ('HIGH - min SOC stayed high, target may be too conservative' if states('input_number.overnight_min_battery_soc')|float(0) >= 30 else 'OK - within normal range') }}"
+mode: single
+
