@@ -1,0 +1,482 @@
+id: energy_nightly_battery_charge_advisory
+alias: Energy - Nightly battery charge advisory
+description: "Dynamic v1.8 AlphaESS low-rate battery protection with optional night-charge closed-loop control. Uses Solcast PV Forecast (sensor.solcast_pv_forecast_forecast_tomorrow) as the tomorrow solar production forecast input (switched from Forecast.Solar because historical accuracy analysis showed Forecast.Solar had ~68% MAPE on this site). v1.7 keeps the fixed forecast-to-target base curve, removes the low-SOC target floor, uses weather.get_forecasts hourly data for tomorrow 07:00-18:00 Melbourne local weather floors, and protects the battery from discharging inside the AGL 00:00-06:00 low-rate window. At 23:55 it prepares the target SOC and discharge window. At 00:01 it enables discharge time control; if SOC is still at least 2 points below target it also enables normal AlphaESS grid charging battery mode. Closed-loop checks may downgrade from grid charging plus discharge control to discharge control only after target is reached. Cleanup preserves discharge control until 06:00, then disables scheduled controls at 06:00/06:05/06:15/07:00. No force discharge, force export, VPP override, feed-in limit, inverter mode, or Tesla control is used. [v1.9-P0 patch applied 2026-08-16: (A) removed unconditional winter(Jun/Jul/Aug)->70% floor from control_target, rain->80%/cloudy->75% floors unchanged; (B) Solcast forecast is now blended with Solcast P10 via solcast_solar.query_forecast_data before base_target tiering, blend = (1-w)*P50 + w*P10 where w = input_number.alphaess_pv_pessimism_weight (default 0.15); on query failure or when Solcast sensor itself invalid, falls back unchanged to prior forecast_state logic (Solcast->Forecast.Solar->85% chain preserved as-is). Base_target tier thresholds (6/8/11/14 kWh -> 85/75/65/55/45%) unchanged.] [v1.9-P1 patch applied 2026-08-29: (A) control_target now also applies a 75% floor when cloudy_weather is true and rain_weather is false (previously computed but unused, so cloudy days had no floor at all, contradicting this description); (B) fixed unreachable choose branch — the SOC-reached-target closed-loop downgrade branch (\"closed-loop stopped grid charging early\") could never fire because the broader near-target protect-only branch preceded it and its condition was a superset; reordered so the specific downgrade (requires select was actually charge_and_protect_option) is checked first, generic protect-only second; confirmed via notification history that v1.8 never once produced the downgrade message even though v1.7 had. (C) Weekly/monthly reviews now also pull the AlphaESS per-tariff-period import meters (night_8c/shoulder_19c/peak_33c) and the feed-in meter, and compute real $ cost using current AGL rates: night 8c, off-peak/shoulder 20.16c, peak 35.92c, feed-in 5c per kWh, plus a 108.9c/day supply charge, reporting import cost, export revenue, supply charge and net grid cost alongside the existing kWh figures. Update these four rate constants here and in the review variables if the plan changes again.]"
+triggers:
+  - trigger: time
+    at: 23:30:00
+    id: advisory
+  - trigger: time
+    at: 23:55:00
+    id: target_write
+  - trigger: time
+    at: 00:01:00
+    id: grid_charge_start
+  - trigger: time
+    at: 02:00:00
+    id: closed_loop_check
+  - trigger: time
+    at: 04:00:00
+    id: closed_loop_check
+  - trigger: time
+    at: 05:30:00
+    id: closed_loop_check
+  - trigger: time
+    at: 05:55:00
+    id: cleanup
+  - trigger: time
+    at: 05:58:00
+    id: cleanup_verify
+  - trigger: time
+    at: 06:00:00
+    id: final_cleanup
+  - trigger: time
+    at: 06:05:00
+    id: cleanup
+  - trigger: time
+    at: 06:15:00
+    id: cleanup
+  - trigger: time
+    at: 06:30:00
+    id: cleanup_alert
+  - trigger: time
+    at: 07:00:00
+    id: cleanup
+  - trigger: time
+    at: 09:00:00
+    id: monthly_report
+  - trigger: time
+    at: 09:30:00
+    id: weekly_strategy_review
+conditions: []
+actions:
+  - action: weather.get_forecasts
+    continue_on_error: true
+    target:
+      entity_id: weather.forecast_wo_de_jia
+    data:
+      type: hourly
+    response_variable: weather_hourly
+  - action: solcast_solar.query_forecast_data
+    continue_on_error: true
+    data:
+      start_date_time: "{{ (now() + timedelta(days=1)).strftime('%Y-%m-%d') }}T00:00:00"
+      end_date_time: "{{ (now() + timedelta(days=1)).strftime('%Y-%m-%d') }}T23:59:59"
+    response_variable: solcast_detail_tomorrow
+  - variables:
+      rain_probability_threshold: 70
+      soc_state: "{{ states('sensor.alphaess_inverter_battery_state_of_charge') }}"
+      solcast_state: "{{ states('sensor.solcast_pv_forecast_forecast_tomorrow') }}"
+      solcast_ok: "{{ solcast_state not in ['unknown', 'unavailable', 'none', ''] and solcast_state | is_number }}"
+      forecast_solar_state: "{{ states('sensor.energy_production_tomorrow') }}"
+      forecast_solar_ok: "{{ forecast_solar_state not in ['unknown', 'unavailable', 'none', ''] and forecast_solar_state | is_number }}"
+      forecast_source_used: "{% if solcast_ok %}solcast{% elif forecast_solar_ok %}forecast_solar_fallback{% else %}none{% endif %}"
+      forecast_state: "{% if solcast_ok %}{{ solcast_state }}{% elif forecast_solar_ok %}{{ forecast_solar_state }}{% else %}unavailable{% endif %}"
+      soc: "{{ soc_state | float(0) }}"
+      pessimism_weight: "{{ states('input_number.alphaess_pv_pessimism_weight') | float(0.15) }}"
+      solcast_p50_tomorrow_query: "{% set rows = solcast_detail_tomorrow.data if solcast_detail_tomorrow is defined and solcast_detail_tomorrow.data is defined else [] %}\n{% set tomorrow = (now() + timedelta(days=1)).strftime('%Y-%m-%d') %}\n{% set ns = namespace(total=0) %}\n{% for item in rows %}\n  {% if item.period_start.strftime('%Y-%m-%d')== tomorrow %}\n    {% set ns.total = ns.total + (item.pv_estimate | float(0)) * 0.5 %}\n  {% endif %}\n{% endfor %}\n{{ ns.total | round(3) }}"
+      solcast_p10_tomorrow_query: "{% set rows = solcast_detail_tomorrow.data if solcast_detail_tomorrow is defined and solcast_detail_tomorrow.data is defined else [] %}\n{% set tomorrow = (now() + timedelta(days=1)).strftime('%Y-%m-%d') %}\n{% set ns = namespace(total=0) %}\n{% for item in rows %}\n  {% if item.period_start.strftime('%Y-%m-%d')== tomorrow %}\n    {% set ns.total = ns.total + (item.pv_estimate10 | float(0)) * 0.5 %}\n  {% endif %}\n{% endfor %}\n{{ ns.total | round(3) }}"
+      solcast_query_ok: "{{ solcast_detail_tomorrow is defined and solcast_detail_tomorrow.data is defined and (solcast_detail_tomorrow.data | length) > 0 and (solcast_p50_tomorrow_query | float(0)) > 0 }}"
+      blended_forecast: "{% if solcast_ok and solcast_query_ok %}\n  {% set w = pessimism_weight %}\n  {{ ((1 - w) * (solcast_p50_tomorrow_query | float(0)) + w * (solcast_p10_tomorrow_query | float(0))) | round(3) }}\n{% else %}\n  {{ forecast_state | float(0) }}\n{% endif %}"
+      raw_solar: "{{ blended_forecast | float(0) }}"
+      forecast_multiplier: 1
+      corrected_solar: "{{ (raw_solar | float(0)) * (forecast_multiplier | float(1.0)) }}"
+      tomorrow_weather_count: "{% set rows = weather_hourly['weather.forecast_wo_de_jia'].forecast\n  if weather_hourly is defined\n  and weather_hourly['weather.forecast_wo_de_jia'] is defined\n  and weather_hourly['weather.forecast_wo_de_jia'].forecast is defined\n  else [] %}\n{% set tomorrow = (now() + timedelta(days=1)).strftime('%Y-%m-%d') %}\n{% set ns = namespace(count=0) %}\n{% for item in rows %}\n  {% set dt = as_local(as_datetime(item.datetime)) if item.datetime is defined else none %}\n  {% if dt is not none and dt.strftime('%Y-%m-%d') == tomorrow and 7 <= dt.hour < 18 %}\n    {% set ns.count = ns.count + 1 %}\n  {% endif %}\n{% endfor %}\n{{ ns.count }}"
+      tomorrow_conditions: "{% set rows = weather_hourly['weather.forecast_wo_de_jia'].forecast\n  if weather_hourly is defined\n  and weather_hourly['weather.forecast_wo_de_jia'] is defined\n  and weather_hourly['weather.forecast_wo_de_jia'].forecast is defined\n  else [] %}\n{% set tomorrow = (now() + timedelta(days=1)).strftime('%Y-%m-%d') %}\n{% set ns = namespace(items=[]) %}\n{% for item in rows %}\n  {% set dt = as_local(as_datetime(item.datetime)) if item.datetime is defined else none %}\n  {% if dt is not none and dt.strftime('%Y-%m-%d') == tomorrow and 7 <= dt.hour < 18 and item.condition is defined %}\n    {% set ns.items = ns.items + [item.condition | lower] %}\n  {% endif %}\n{% endfor %}\n{{ ns.items | unique | list | join(',') }}"
+      tomorrow_max_precipitation_probability: "{% set rows = weather_hourly['weather.forecast_wo_de_jia'].forecast\n  if weather_hourly is defined\n  and weather_hourly['weather.forecast_wo_de_jia'] is defined\n  and weather_hourly['weather.forecast_wo_de_jia'].forecast is defined\n  else [] %}\n{% set tomorrow = (now() + timedelta(days=1)).strftime('%Y-%m-%d') %}\n{% set ns = namespace(max=-1) %}\n{% for item in rows %}\n  {% set dt = as_local(as_datetime(item.datetime)) if item.datetime is defined else none %}\n  {% if dt is not none and dt.strftime('%Y-%m-%d') == tomorrow and 7 <= dt.hour < 18 and item.precipitation_probability is defined %}\n    {% set ns.max = [ns.max, item.precipitation_probability | float(-1)] | max %}\n  {% endif %}\n{% endfor %}\n{{ ns.max }}"
+      tomorrow_max_precipitation: "{% set rows = weather_hourly['weather.forecast_wo_de_jia'].forecast\n  if weather_hourly is defined\n  and weather_hourly['weather.forecast_wo_de_jia'] is defined\n  and weather_hourly['weather.forecast_wo_de_jia'].forecast is defined\n  else [] %}\n{% set tomorrow = (now() + timedelta(days=1)).strftime('%Y-%m-%d') %}\n{% set ns = namespace(max=-1) %}\n{% for item in rows %}\n  {% set dt = as_local(as_datetime(item.datetime)) if item.datetime is defined else none %}\n  {% if dt is not none and dt.strftime('%Y-%m-%d') == tomorrow and 7 <= dt.hour < 18 and item.precipitation is defined %}\n    {% set ns.max = [ns.max, item.precipitation | float(-1)] | max %}\n  {% endif %}\n{% endfor %}\n{{ ns.max }}"
+      tomorrow_max_cloud_coverage: "{% set rows = weather_hourly['weather.forecast_wo_de_jia'].forecast\n  if weather_hourly is defined\n  and weather_hourly['weather.forecast_wo_de_jia'] is defined\n  and weather_hourly['weather.forecast_wo_de_jia'].forecast is defined\n  else [] %}\n{% set tomorrow = (now() + timedelta(days=1)).strftime('%Y-%m-%d') %}\n{% set ns = namespace(max=-1) %}\n{% for item in rows %}\n  {% set dt = as_local(as_datetime(item.datetime)) if item.datetime is defined else none %}\n  {% if dt is not none and dt.strftime('%Y-%m-%d') == tomorrow and 7 <= dt.hour < 18 and item.cloud_coverage is defined %}\n    {% set ns.max = [ns.max, item.cloud_coverage | float(-1)] | max %}\n  {% endif %}\n{% endfor %}\n{{ ns.max }}"
+      forecast_ok: "{{ forecast_state not in ['unknown', 'unavailable', 'none', ''] and forecast_state | is_number }}"
+      weather_forecast_ok: "{{ tomorrow_weather_count | int(0) > 0 }}"
+      input_ok: "{{ forecast_ok | bool(false) and weather_forecast_ok | bool(false) }}"
+      rain_weather: "{% set c = tomorrow_conditions | lower %}\n{{\n  'rainy' in c\n  or 'pouring' in c\n  or 'lightning-rainy' in c\n  or tomorrow_max_precipitation_probability | float(-1) >= rain_probability_threshold | float(70)\n  or tomorrow_max_precipitation | float(-1) > 0\n}}"
+      cloudy_weather: "{% set c = tomorrow_conditions | lower %}\n{{\n  'cloudy' in c\n  or 'partlycloudy' in c\n  or 'windy-variant' in c\n  or tomorrow_max_cloud_coverage | float(-1) >= 75\n}}"
+      base_target: "{% set adjusted = corrected_solar | float(0) %}\n{% if adjusted < 6 %}{{ states('input_number.battery_target_tier_poor')|float(85)|round(0) }}{% elif adjusted < 8 %}{{ states('input_number.battery_target_tier_limited')|float(75)|round(0) }}{% elif adjusted < 11 %}{{ states('input_number.battery_target_tier_usable')|float(65)|round(0) }}{% elif adjusted < 14 %}{{ states('input_number.battery_target_tier_good')|float(55)|round(0) }}{% else %}{{ states('input_number.battery_target_tier_strong')|float(45)|round(0) }}{% endif %}"
+      control_target: "{% if not (input_ok | bool(false)) %}\n  85\n{% else %}\n  {% set t = base_target | float(85) %}\n  {% set adjusted = corrected_solar | float(0) %} {% set floor = 0 %} {% if adjusted < 11 %} {% if rain_weather | bool(false) %} {% set floor = [floor, 80] | max %} {% elif cloudy_weather | bool(false) %} {% set floor = [floor, 75] | max %} {% endif %} {% endif %}\n  {{ [85, [45, [t, floor] | max] | max] | min | round(0) }}\n{% endif %}"
+      advisory_target: "{{ control_target }}"
+      write_target: "{{ control_target }}"
+      sensor_ok: "{{\n  states('sensor.alphaess_inverter_battery_state_of_charge') not in ['unknown', 'unavailable', 'none']\n  and states('sensor.solcast_pv_forecast_forecast_tomorrow') not in ['unknown', 'unavailable', 'none']\n  and states('select.alphaess_inverter_charging_discharging_settings') not in ['unknown', 'unavailable', 'none']\n  and states('number.alphaess_inverter_charging_cutoff_soc') not in ['unknown', 'unavailable', 'none']\n}}"
+      forecast_class: "{% set adjusted = corrected_solar | float(0) %}\n{% if adjusted < 6 %}poor solar forecast{% elif adjusted < 8 %}limited solar forecast{% elif adjusted < 11 %}usable solar forecast{% elif adjusted < 14 %}good solar forecast{% else %}strong solar forecast{% endif %}"
+      charge_needed_kwh: "{% set needed = ((write_target | float(85) - soc | float(0)) / 100 * 20.0) %}\n{{ [0, needed] | max | round(1) }}"
+      cost_estimate: "{{ (charge_needed_kwh | float(0) * 0.08) | round(2) }}"
+      charge_select: "{{ states('select.alphaess_inverter_charging_discharging_settings') }}"
+      discharge_only_option: Enable Battery Discharge Time Control
+      charge_and_protect_option: Enable Grid Charging Battery & Battery Discharge Time Control
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'weekly_strategy_review' and now().weekday() == 0 }}"
+        sequence:
+          - action: recorder.get_statistics
+            data:
+              start_time: "{{ (now() - timedelta(days=7)).isoformat() }}"
+              end_time: "{{ now().isoformat() }}"
+              statistic_ids:
+                - sensor.alphaess_inverter_battery_state_of_charge
+                - sensor.alphaess_inverter_total_energy_charge_battery_from_grid
+                - sensor.alphaess_inverter_total_energy_feed_to_grid_meter
+                - sensor.alphaess_inverter_total_energy_consumption_from_grid_meter
+                - sensor.ke_ting_alphaess_inverter_pv_ac_meter_energy_total
+                - sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_night_8c
+                - sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_shoulder_19c
+                - sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_peak_33c
+                - sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_mai_dian_feed_in
+              period: day
+              types:
+                - mean
+                - min
+                - max
+                - change
+            response_variable: weekly_stats
+          - variables:
+              soc_days: "{{ weekly_stats.statistics['sensor.alphaess_inverter_battery_state_of_charge'] | default([]) }}"
+              soc_min_week: "{{ (soc_days | map(attribute='min') | list | select('number') | list | min) if soc_days else 'n/a' }}"
+              soc_mean_week: "{{ ((soc_days | map(attribute='mean') | list | select('number') | list | sum) / (soc_days | length)) | round(1) if soc_days else 'n/a' }}"
+              grid_charge_days: "{{ weekly_stats.statistics['sensor.alphaess_inverter_total_energy_charge_battery_from_grid'] | default([]) }}"
+              grid_charge_total: "{{ (grid_charge_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if grid_charge_days else 'n/a' }}"
+              export_days: "{{ weekly_stats.statistics['sensor.alphaess_inverter_total_energy_feed_to_grid_meter'] | default([]) }}"
+              export_total: "{{ (export_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if export_days else 'n/a' }}"
+              import_days: "{{ weekly_stats.statistics['sensor.alphaess_inverter_total_energy_consumption_from_grid_meter'] | default([]) }}"
+              import_total: "{{ (import_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if import_days else 'n/a' }}"
+              pv_actual_days: "{{ weekly_stats.statistics['sensor.ke_ting_alphaess_inverter_pv_ac_meter_energy_total'] | default([]) }}"
+              pv_actual_total: "{{ (pv_actual_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if pv_actual_days else 'n/a (helper still building history)' }}"
+              solcast_now: "{{ state_attr('sensor.solcast_pv_forecast_forecast_tomorrow', 'estimate') }}"
+              night_days: "{{ weekly_stats.statistics['sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_night_8c'] | default([]) }}"
+              night_total: "{{ (night_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if night_days else 0 }}"
+              shoulder_days: "{{ weekly_stats.statistics['sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_shoulder_19c'] | default([]) }}"
+              shoulder_total: "{{ (shoulder_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if shoulder_days else 0 }}"
+              peak_days: "{{ weekly_stats.statistics['sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_peak_33c'] | default([]) }}"
+              peak_total: "{{ (peak_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if peak_days else 0 }}"
+              feedin_days: "{{ weekly_stats.statistics['sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_mai_dian_feed_in'] | default([]) }}"
+              feedin_total: "{{ (feedin_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if feedin_days else 0 }}"
+              rate_night: "0.08"
+              rate_shoulder: "0.2016"
+              rate_peak: "0.3592"
+              rate_feedin: "0.05"
+              supply_charge_daily: "1.089"
+              import_cost: "{{ ((night_total | float(0)) * (rate_night | float(0)) + (shoulder_total | float(0)) * (rate_shoulder | float(0)) + (peak_total | float(0)) * (rate_peak | float(0))) | round(2) }}"
+              export_revenue: "{{ ((feedin_total | float(0)) * (rate_feedin | float(0))) | round(2) }}"
+              supply_cost: "{{ ((supply_charge_daily | float(0)) * 7) | round(2) }}"
+              net_cost: "{{ ((import_cost | float(0)) + (supply_cost | float(0)) - (export_revenue | float(0))) | round(2) }}"
+              total_period_kwh: "{{ ((night_total | float(0)) + (shoulder_total | float(0)) + (peak_total | float(0))) | round(1) }}"
+              baseline_rate: "{{ ((6*(rate_night|float(0)) + 9*(rate_shoulder|float(0)) + 6*(rate_peak|float(0)) + 3*(rate_shoulder|float(0))) / 24) | round(4) }}"
+              baseline_energy_cost: "{{ ((total_period_kwh | float(0)) * (baseline_rate | float(0))) | round(2) }}"
+              strategy_savings: "{{ ((baseline_energy_cost | float(0)) - (import_cost | float(0))) | round(2) }}"
+          - action: persistent_notification.create
+            data:
+              title: Weekly energy strategy review (data-backed)
+              message: "Past 7 days (real recorder data, no automation parameters changed): battery SOC min {{ soc_min_week }}% / avg {{ soc_mean_week }}%. Grid charge into battery: {{ grid_charge_total }} kWh total. Grid export: {{ export_total }} kWh, grid import: {{ import_total }} kWh. Actual PV generation (AC-coupled, tracked via integral helper since the AlphaESS total_energy_from_pv register does not support AC-coupled solar): {{ pv_actual_total }} kWh. Solcast current tomorrow estimate: {{ solcast_now }} kWh. Review manually before changing base_target/floor values; require at least 14 days, preferably 28, before changing the PV forecast source or model. Cost estimate (night 8c/off-peak 20.16c/peak 35.92c per kWh, feed-in 5c/kWh, supply charge {{ supply_charge_daily }}/day): import cost ${{ import_cost }}, export revenue ${{ export_revenue }}, supply charge ${{ supply_cost }}, net grid cost ${{ net_cost }}. Weekly usage: {{ total_period_kwh }} kWh total (night {{ night_total }} / off-peak {{ shoulder_total }} / peak {{ peak_total }} kWh). Estimated savings from night-charging strategy vs a flat unshifted rate: ${{ strategy_savings }} (baseline would have cost ${{ baseline_energy_cost }} at a {{ baseline_rate }}/kWh time-weighted average vs actual ${{ import_cost }})."
+          - action: notify.mobile_app_chen_iphone
+            data:
+              title: Weekly battery strategy review ready
+              message: "本周用电 {{ total_period_kwh }}kWh(谷{{ night_total }}/平{{ shoulder_total }}/峰{{ peak_total }}kWh)。谷电充电策略本周帮你省了约${{ strategy_savings }}(对比不做时段优化的话本来要花${{ baseline_energy_cost }},实际电量花费${{ import_cost }})。净电网支出(含supply charge、扣掉卖电): ${{ net_cost }}。SOC min {{ soc_min_week }}% / avg {{ soc_mean_week }}%. Open Home Assistant for the full weekly review notification."
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'monthly_report' and now().day == 3 }}"
+        sequence:
+          - action: recorder.get_statistics
+            data:
+              start_time: "{{ (now() - timedelta(days=30)).isoformat() }}"
+              end_time: "{{ now().isoformat() }}"
+              statistic_ids:
+                - sensor.alphaess_inverter_battery_state_of_charge
+                - sensor.alphaess_inverter_total_energy_charge_battery_from_grid
+                - sensor.alphaess_inverter_total_energy_feed_to_grid_meter
+                - sensor.alphaess_inverter_total_energy_consumption_from_grid_meter
+                - sensor.ke_ting_alphaess_inverter_pv_ac_meter_energy_total
+                - sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_night_8c
+                - sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_shoulder_19c
+                - sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_peak_33c
+                - sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_mai_dian_feed_in
+              period: day
+              types:
+                - mean
+                - min
+                - max
+                - change
+            response_variable: monthly_stats
+          - variables:
+              soc_days_m: "{{ monthly_stats.statistics['sensor.alphaess_inverter_battery_state_of_charge'] | default([]) }}"
+              soc_min_month: "{{ (soc_days_m | map(attribute='min') | list | select('number') | list | min) if soc_days_m else 'n/a' }}"
+              soc_mean_month: "{{ ((soc_days_m | map(attribute='mean') | list | select('number') | list | sum) / (soc_days_m | length)) | round(1) if soc_days_m else 'n/a' }}"
+              grid_charge_days_m: "{{ monthly_stats.statistics['sensor.alphaess_inverter_total_energy_charge_battery_from_grid'] | default([]) }}"
+              grid_charge_total_m: "{{ (grid_charge_days_m | map(attribute='change') | list | select('number') | list | sum) | round(1) if grid_charge_days_m else 'n/a' }}"
+              export_days_m: "{{ monthly_stats.statistics['sensor.alphaess_inverter_total_energy_feed_to_grid_meter'] | default([]) }}"
+              export_total_m: "{{ (export_days_m | map(attribute='change') | list | select('number') | list | sum) | round(1) if export_days_m else 'n/a' }}"
+              import_days_m: "{{ monthly_stats.statistics['sensor.alphaess_inverter_total_energy_consumption_from_grid_meter'] | default([]) }}"
+              import_total_m: "{{ (import_days_m | map(attribute='change') | list | select('number') | list | sum) | round(1) if import_days_m else 'n/a' }}"
+              pv_actual_days_m: "{{ monthly_stats.statistics['sensor.ke_ting_alphaess_inverter_pv_ac_meter_energy_total'] | default([]) }}"
+              pv_actual_total_m: "{{ (pv_actual_days_m | map(attribute='change') | list | select('number') | list | sum) | round(1) if pv_actual_days_m else 'n/a (helper still building history)' }}"
+              night_days: "{{ monthly_stats.statistics['sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_night_8c'] | default([]) }}"
+              night_total: "{{ (night_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if night_days else 0 }}"
+              shoulder_days: "{{ monthly_stats.statistics['sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_shoulder_19c'] | default([]) }}"
+              shoulder_total: "{{ (shoulder_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if shoulder_days else 0 }}"
+              peak_days: "{{ monthly_stats.statistics['sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_gou_dian_fen_shi_duan_peak_33c'] | default([]) }}"
+              peak_total: "{{ (peak_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if peak_days else 0 }}"
+              feedin_days: "{{ monthly_stats.statistics['sensor.ke_ting_alphaess_inverter_mei_ri_dian_wang_mai_dian_feed_in'] | default([]) }}"
+              feedin_total: "{{ (feedin_days | map(attribute='change') | list | select('number') | list | sum) | round(1) if feedin_days else 0 }}"
+              rate_night: "0.08"
+              rate_shoulder: "0.2016"
+              rate_peak: "0.3592"
+              rate_feedin: "0.05"
+              supply_charge_daily: "1.089"
+              import_cost: "{{ ((night_total | float(0)) * (rate_night | float(0)) + (shoulder_total | float(0)) * (rate_shoulder | float(0)) + (peak_total | float(0)) * (rate_peak | float(0))) | round(2) }}"
+              export_revenue: "{{ ((feedin_total | float(0)) * (rate_feedin | float(0))) | round(2) }}"
+              supply_cost: "{{ ((supply_charge_daily | float(0)) * 30) | round(2) }}"
+              net_cost: "{{ ((import_cost | float(0)) + (supply_cost | float(0)) - (export_revenue | float(0))) | round(2) }}"
+              total_period_kwh: "{{ ((night_total | float(0)) + (shoulder_total | float(0)) + (peak_total | float(0))) | round(1) }}"
+              baseline_rate: "{{ ((6*(rate_night|float(0)) + 9*(rate_shoulder|float(0)) + 6*(rate_peak|float(0)) + 3*(rate_shoulder|float(0))) / 24) | round(4) }}"
+              baseline_energy_cost: "{{ ((total_period_kwh | float(0)) * (baseline_rate | float(0))) | round(2) }}"
+              strategy_savings: "{{ ((baseline_energy_cost | float(0)) - (import_cost | float(0))) | round(2) }}"
+          - action: persistent_notification.create
+            data:
+              title: Monthly energy optimization report due
+              message: "Past 30 days (real recorder data, no automation parameters changed): battery SOC min {{ soc_min_month }}% / avg {{ soc_mean_month }}%. Grid charge into battery: {{ grid_charge_total_m }} kWh total. Grid export: {{ export_total_m }} kWh, grid import: {{ import_total_m }} kWh. Actual PV generation (AC-coupled, tracked via integral helper since the AlphaESS total_energy_from_pv register does not support AC-coupled solar): {{ pv_actual_total_m }} kWh. Use these real numbers plus your AGL bill to generate the previous month's energy optimization report and bill audit, comparing optimized billing against a no-optimization estimate. Cost estimate (night 8c/off-peak 20.16c/peak 35.92c per kWh, feed-in 5c/kWh, supply charge {{ supply_charge_daily }}/day): import cost ${{ import_cost }}, export revenue ${{ export_revenue }}, supply charge ${{ supply_cost }}, net grid cost ${{ net_cost }}. Monthly usage: {{ total_period_kwh }} kWh total (night {{ night_total }} / off-peak {{ shoulder_total }} / peak {{ peak_total }} kWh). Estimated savings from night-charging strategy vs a flat unshifted rate: ${{ strategy_savings }} (baseline would have cost ${{ baseline_energy_cost }} at a {{ baseline_rate }}/kWh time-weighted average vs actual ${{ import_cost }})."
+          - action: notify.mobile_app_chen_iphone
+            data:
+              title: Monthly energy report ready
+              message: "本月用电 {{ total_period_kwh }}kWh(谷{{ night_total }}/平{{ shoulder_total }}/峰{{ peak_total }}kWh)。谷电充电策略本月帮你省了约${{ strategy_savings }}(基准${{ baseline_energy_cost }} vs 实际${{ import_cost }})。净电网支出: ${{ net_cost }}。SOC min {{ soc_min_month }}% / avg {{ soc_mean_month }}%. Open Home Assistant for the full monthly report notification."
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'advisory' }}"
+        sequence:
+          - action: persistent_notification.create
+            data:
+              title: Tonight battery charge advisory
+              message: "Strategy: dynamic v1.8 (Solcast primary / Forecast.Solar fallback, low-rate discharge protected). Forecast source used tonight: {{ forecast_source_used }}. Raw tomorrow solar forecast: {{ raw_solar | round(1) }} kWh. Forecast input valid: {{ forecast_ok }}. Tomorrow daylight weather samples: {{ tomorrow_weather_count }}. Conditions: {{ tomorrow_conditions }}. Max precipitation probability: {{ tomorrow_max_precipitation_probability }}%. Max precipitation: {{ tomorrow_max_precipitation }}. Max cloud coverage: {{ tomorrow_max_cloud_coverage }}%. Rain floor active: {{ rain_weather }}. Cloud floor active: {{ cloudy_weather }}. Base target: {{ base_target | round(0) }}%. Final target: {{ write_target | round(0) }}%. Current SOC: {{ soc | round(1) }}%. Approx. grid charge needed: {{ charge_needed_kwh }} kWh. Approx. cost at 8 c/kWh: ${{ cost_estimate }}. At 23:55 HA may set cutoff SOC and discharge window 06:00-23:59. At 00:01 HA should prevent battery discharge during the low-rate window and may also enable grid charging if SOC remains below target. Scheduled controls must be disabled at/after 06:00."
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'advisory' and forecast_source_used == 'forecast_solar_fallback' }}"
+        sequence:
+          - action: persistent_notification.create
+            data:
+              title: AlphaESS v1.8 forecast source degraded to Forecast.Solar
+              message: Solcast forecast sensor (sensor.solcast_pv_forecast_forecast_tomorrow) is unavailable or non-numeric right now. Falling back to Forecast.Solar (sensor.energy_production_tomorrow = {{ forecast_solar_state }} kWh) for tonight's target calculation. Please check the Solcast integration if this persists.
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'target_write' }}"
+          - condition: template
+            alias: Required AlphaESS scheduling control entities are available
+            value_template: "{{ sensor_ok }}"
+        sequence:
+          - action: time.set_value
+            target:
+              entity_id: time.alphaess_inverter_charging_period_1_start_time
+            data:
+              time: 00:00:00
+          - action: time.set_value
+            target:
+              entity_id: time.alphaess_inverter_charging_period_1_stop_time
+            data:
+              time: 06:00:00
+          - action: time.set_value
+            target:
+              entity_id: time.alphaess_inverter_discharging_period_1_start_time
+            data:
+              time: 06:00:00
+          - action: time.set_value
+            target:
+              entity_id: time.alphaess_inverter_discharging_period_1_stop_time
+            data:
+              time: 23:59:00
+          - action: number.set_value
+            target:
+              entity_id: number.alphaess_inverter_charging_cutoff_soc
+            data:
+              value: "{{ write_target | float(85) }}"
+          - delay:
+              seconds: 5
+          - variables:
+              write_ok_1: "{{\n  states('time.alphaess_inverter_charging_period_1_start_time') == '00:00:00'\n  and states('time.alphaess_inverter_charging_period_1_stop_time') == '06:00:00'\n  and states('time.alphaess_inverter_discharging_period_1_start_time') == '06:00:00'\n  and states('time.alphaess_inverter_discharging_period_1_stop_time') == '23:59:00'\n  and (states('number.alphaess_inverter_charging_cutoff_soc') | float(-1) - (write_target | float(85))) | abs < 0.5\n}}"
+              write_ok_2: false
+          - if:
+              - condition: template
+                value_template: "{{ not write_ok_1 }}"
+            then:
+              - action: time.set_value
+                target:
+                  entity_id: time.alphaess_inverter_charging_period_1_start_time
+                data:
+                  time: 00:00:00
+              - action: time.set_value
+                target:
+                  entity_id: time.alphaess_inverter_charging_period_1_stop_time
+                data:
+                  time: 06:00:00
+              - action: time.set_value
+                target:
+                  entity_id: time.alphaess_inverter_discharging_period_1_start_time
+                data:
+                  time: 06:00:00
+              - action: time.set_value
+                target:
+                  entity_id: time.alphaess_inverter_discharging_period_1_stop_time
+                data:
+                  time: 23:59:00
+              - action: number.set_value
+                target:
+                  entity_id: number.alphaess_inverter_charging_cutoff_soc
+                data:
+                  value: "{{ write_target | float(85) }}"
+              - delay:
+                  seconds: 5
+              - variables:
+                  write_ok_2: "{{\n  states('time.alphaess_inverter_charging_period_1_start_time') == '00:00:00'\n  and states('time.alphaess_inverter_charging_period_1_stop_time') == '06:00:00'\n  and states('time.alphaess_inverter_discharging_period_1_start_time') == '06:00:00'\n  and states('time.alphaess_inverter_discharging_period_1_stop_time') == '23:59:00'\n  and (states('number.alphaess_inverter_charging_cutoff_soc') | float(-1) - (write_target | float(85))) | abs < 0.5\n}}"
+              - if:
+                  - condition: template
+                    value_template: "{{ not write_ok_2 }}"
+                then:
+                  - action: persistent_notification.create
+                    data:
+                      title: AlphaESS v1.8 write verification FAILED
+                      message: "Target write at 23:55 could not be verified after one retry. Readback: charge {{ states('time.alphaess_inverter_charging_period_1_start_time') }}-{{ states('time.alphaess_inverter_charging_period_1_stop_time') }}, discharge {{ states('time.alphaess_inverter_discharging_period_1_start_time') }}-{{ states('time.alphaess_inverter_discharging_period_1_stop_time') }}, cutoff SOC {{ states('number.alphaess_inverter_charging_cutoff_soc') }} (target {{ write_target | round(0) }}%). Please check the AlphaESS Modbus connection manually."
+          - action: persistent_notification.create
+            data:
+              title: AlphaESS dynamic v1.8 target prepared
+              message: "v1.8 set AlphaESS charging cutoff SOC to {{ write_target | round(0) }}% and prepared charge window 00:00-06:00 plus discharge window 06:00-23:59 (write verified: {{ write_ok_1 or write_ok_2 }}). Forecast source used: {{ forecast_source_used }}. At 00:01 HA should protect the battery from discharging during the low-rate window, and may also enable grid charging if SOC remains at least 2 points below target. Current SOC: {{ soc | round(1) }}%."
+          - action: input_number.set_value
+            metadata: {}
+            target:
+              entity_id: input_number.alphaessye_jian_mu_biao_socji_lu
+            data:
+              value: "{{ write_target | float(85) | round(1) }}"
+          - action: input_number.set_value
+            metadata: {}
+            target:
+              entity_id: input_number.alphaessye_jian_yu_ce_fa_dian_liang_ji_lu
+            data:
+              value: "{{ corrected_solar | float(0) | round(2) }}"
+          - action: input_text.set_value
+            metadata: {}
+            target:
+              entity_id: input_text.alphaessye_jian_jue_ce_ji_lu
+            data:
+              value: "{{ {'ts': now().strftime('%Y-%m-%d %H:%M'), 'target': write_target|float(85)|round(1), 'fc_kwh': corrected_solar|float(0)|round(2), 'src': forecast_source_used, 'rain': rain_weather|bool(false), 'cloudy': cloudy_weather|bool(false), 'soc': soc|float(0)|round(1)} | tojson }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id in ['grid_charge_start', 'closed_loop_check'] }}"
+          - condition: template
+            alias: Required AlphaESS scheduling control entities are available
+            value_template: "{{ sensor_ok }}"
+          - condition: template
+            alias: Still inside the AGL 00:00-06:00 low-rate window
+            value_template: "{{ 0 <= now().hour < 6 }}"
+          - condition: template
+            alias: Only charge when at least 2 SOC points below target
+            value_template: "{{ soc | float(0) + 2 < write_target | float(85) }}"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: number.alphaess_inverter_charging_cutoff_soc
+            data:
+              value: "{{ write_target | float(85) }}"
+          - action: select.select_option
+            target:
+              entity_id: select.alphaess_inverter_charging_discharging_settings
+            data:
+              option: "{{ charge_and_protect_option }}"
+          - action: persistent_notification.create
+            data:
+              title: AlphaESS dynamic v1.8 grid charging and discharge protection enabled
+              message: "v1.8 enabled normal AlphaESS grid charging and battery discharge time control inside the AGL low-rate window. SOC: {{ soc | round(1) }}%. Target: {{ write_target | round(0) }}%. Forecast: {{ corrected_solar | round(1) }} kWh. Rain floor: {{ rain_weather }}. Cloud floor: {{ cloudy_weather }}."
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id in ['grid_charge_start', 'closed_loop_check'] }}"
+          - condition: template
+            alias: Required AlphaESS scheduling control entities are available
+            value_template: "{{ sensor_ok }}"
+          - condition: template
+            alias: Still inside the AGL 00:00-06:00 low-rate window
+            value_template: "{{ 0 <= now().hour < 6 }}"
+          - condition: template
+            alias: SOC fully reached target
+            value_template: "{{ soc | float(0) >= write_target | float(85) }}"
+          - condition: template
+            alias: Was actively grid-charging (this is a genuine downgrade, not a case that never needed charging)
+            value_template: "{{ states('select.alphaess_inverter_charging_discharging_settings') == charge_and_protect_option }}"
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: select.alphaess_inverter_charging_discharging_settings
+            data:
+              option: "{{ discharge_only_option }}"
+          - action: persistent_notification.create
+            data:
+              title: AlphaESS v1.8 closed-loop stopped grid charging early
+              message: Closed-loop check downgraded AlphaESS to battery discharge time control only because SOC {{ soc | round(1) }}% reached target {{ write_target | round(0) }}%. Low-rate window discharge protection remains active.
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id in ['grid_charge_start', 'closed_loop_check'] }}"
+          - condition: template
+            alias: Required AlphaESS scheduling control entities are available
+            value_template: "{{ sensor_ok }}"
+          - condition: template
+            alias: Still inside the AGL 00:00-06:00 low-rate window
+            value_template: "{{ 0 <= now().hour < 6 }}"
+          - condition: template
+            alias: Target already met so protect battery without grid charging
+            value_template: "{{ soc | float(0) + 2 >= write_target | float(85) }}"
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: select.alphaess_inverter_charging_discharging_settings
+            data:
+              option: "{{ discharge_only_option }}"
+          - action: persistent_notification.create
+            data:
+              title: AlphaESS dynamic v1.8 discharge protection enabled
+              message: v1.8 did not enable grid charging because SOC {{ soc | round(1) }}% is already near target {{ write_target | round(0) }}%, but it enabled battery discharge time control so the battery should not discharge during the AGL low-rate window.
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'closed_loop_check' }}"
+          - condition: template
+            alias: Sensor failure while AlphaESS grid charging may be enabled
+            value_template: "{{\n  not (sensor_ok | bool(false))\n  and states('select.alphaess_inverter_charging_discharging_settings') not in ['unknown', 'unavailable', 'none', 'Disable']\n}}"
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: select.alphaess_inverter_charging_discharging_settings
+            data:
+              option: "{{ discharge_only_option }}"
+          - action: persistent_notification.create
+            data:
+              title: AlphaESS v1.8 stopped grid charging - sensor unavailable
+              message: Closed-loop check downgraded AlphaESS to battery discharge time control because a required entity or weather forecast input was unavailable. This preserves low-rate window discharge protection while avoiding grid charging with bad inputs.
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id in ['cleanup', 'cleanup_verify'] and now().hour < 6 }}"
+          - condition: template
+            value_template: "{{ states('select.alphaess_inverter_charging_discharging_settings') not in ['unknown', 'unavailable', 'none', discharge_only_option] }}"
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: select.alphaess_inverter_charging_discharging_settings
+            data:
+              option: "{{ discharge_only_option }}"
+          - action: persistent_notification.create
+            data:
+              title: AlphaESS dynamic v1.8 pre-06:00 cleanup completed
+              message: Cleanup trigger {{ trigger.id }} at {{ now().strftime('%H:%M') }} stopped grid charging but kept battery discharge time control active until 06:00.
+      - conditions:
+          - condition: template
+            value_template: "{{\n  trigger.id in ['final_cleanup', 'cleanup', 'cleanup_alert']\n  and now().hour >= 6\n}}"
+          - condition: template
+            value_template: "{{ states('select.alphaess_inverter_charging_discharging_settings') not in ['unknown', 'unavailable', 'none', 'Disable'] }}"
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: select.alphaess_inverter_charging_discharging_settings
+            data:
+              option: Disable
+          - action: persistent_notification.create
+            data:
+              title: AlphaESS dynamic v1.8 cleanup completed
+              message: Cleanup trigger {{ trigger.id }} at {{ now().strftime('%H:%M') }} set AlphaESS charging/discharging control to Disable. Grid charging and discharge time control must not continue after 06:00.
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'cleanup_alert' }}"
+        sequence:
+          - action: persistent_notification.create
+            data:
+              title: AlphaESS cleanup verified
+              message: Cleanup alert check ran at {{ now().strftime('%H:%M') }}. AlphaESS charging/discharging setting is {{ states('select.alphaess_inverter_charging_discharging_settings') }}.
+mode: single
