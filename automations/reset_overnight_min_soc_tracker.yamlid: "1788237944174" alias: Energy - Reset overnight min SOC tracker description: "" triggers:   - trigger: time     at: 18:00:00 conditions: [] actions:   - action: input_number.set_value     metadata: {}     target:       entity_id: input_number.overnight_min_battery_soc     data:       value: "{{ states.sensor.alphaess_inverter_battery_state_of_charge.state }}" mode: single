@@ -1,0 +1,16 @@
+id: "1788237944174"
+alias: Energy - Reset overnight min SOC tracker
+description: ""
+triggers:
+  - trigger: time
+    at: 18:00:00
+conditions: []
+actions:
+  - action: input_number.set_value
+    metadata: {}
+    target:
+      entity_id: input_number.overnight_min_battery_soc
+    data:
+      value: "{{ states.sensor.alphaess_inverter_battery_state_of_charge.state }}"
+mode: single
+
