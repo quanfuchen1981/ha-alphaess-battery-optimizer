@@ -1,0 +1,17 @@
+id: "1788238242607"
+alias: Energy - Track overnight min SOC
+description: ""
+triggers:
+  - trigger: state
+    entity_id:
+      - sensor.alphaess_inverter_battery_state_of_charge
+conditions: []
+actions:
+  - action: input_number.set_value
+    metadata: {}
+    target:
+      entity_id: input_number.overnight_min_battery_soc
+    data:
+      value: "{{ [states('sensor.alphaess_inverter_battery_state_of_charge') | float(100), states('input_number.overnight_min_battery_soc') | float(100)] | min }}"
+mode: single
+
