@@ -1,0 +1,88 @@
+id: "1788277347416"
+alias: Energy - Battery Target Self-Learning
+description: "Self-learning adjustment layer. Each morning, reads last night's forecast tier (parsed from input_text.last_night_charge_decision) and the actual overnight minimum battery SOC. If SOC ran dangerously low, nudges that tier's battery_target_tier_* input_number up; if SOC stayed needlessly high (wasteful, missed cheap-rate charging headroom), nudges it down. Clamped 40-90%. Skips if last night's decision was already processed. Goal: gradually converge each tier's target toward the minimum SOC that is still safe, to reduce grid import cost over time."
+triggers:
+  - trigger: time
+    at: 07:35:00
+conditions: []
+actions:
+  - variables:
+      decision: "{{ states('input_text.last_night_charge_decision') }}"
+      last_processed: "{{ states('input_text.battery_learning_last_processed') }}"
+      min_soc: "{{ states('input_number.overnight_min_battery_soc') | float(999) }}"
+      step_up: 5
+      step_down: 3
+  - if:
+      - condition: template
+        value_template: "{{ decision == last_processed or decision in ['unknown','unavailable',''] }}"
+    then:
+      - action: logbook.log
+        data:
+          name: Battery Self-Learning
+          message: Skipped — decision unchanged or unavailable ({{ decision }})
+    else:
+      - variables:
+          fc_match: "{{ decision | regex_findall('fc=([0-9.]+)kWh') }}"
+          forecast: "{{ (fc_match[0] | float(0)) if fc_match | count > 0 else 0 }}"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ forecast < 6 }}"
+            sequence:
+              - variables:
+                  tier_entity: input_number.battery_target_tier_poor
+                  tier_name: poor
+          - conditions:
+              - condition: template
+                value_template: "{{ forecast < 8 }}"
+            sequence:
+              - variables:
+                  tier_entity: input_number.battery_target_tier_limited
+                  tier_name: limited
+          - conditions:
+              - condition: template
+                value_template: "{{ forecast < 11 }}"
+            sequence:
+              - variables:
+                  tier_entity: input_number.battery_target_tier_usable
+                  tier_name: usable
+          - conditions:
+              - condition: template
+                value_template: "{{ forecast < 14 }}"
+            sequence:
+              - variables:
+                  tier_entity: input_number.battery_target_tier_good
+                  tier_name: good
+        default:
+          - variables:
+              tier_entity: input_number.battery_target_tier_strong
+              tier_name: strong
+      - variables:
+          current_val: "{{ states(tier_entity) | float(60) }}"
+          verdict: "{% if min_soc <= 13 %}LOW{% elif min_soc >= 30 %}HIGH{% else %}OK{% endif %}"
+      - variables:
+          new_val: "{% if verdict == 'LOW' %}{{ [current_val + step_up, 90] | min }}{% elif verdict == 'HIGH' %}{{ [current_val - step_down, 40] | max }}{% else %}{{ current_val }}{% endif %}"
+      - if:
+          - condition: template
+            value_template: "{{ new_val | float != current_val | float }}"
+        then:
+          - action: input_number.set_value
+            target:
+              entity_id: "{{ tier_entity }}"
+            data:
+              value: "{{ new_val }}"
+          - action: logbook.log
+            data:
+              name: Battery Self-Learning
+              message: Tier {{ tier_name }} ({{ forecast }}kWh forecast) — overnight min SOC {{ min_soc }}% = {{ verdict }} → adjusted target {{ current_val }}% → {{ new_val }}%
+        else:
+          - action: logbook.log
+            data:
+              name: Battery Self-Learning
+              message: Tier {{ tier_name }} ({{ forecast }}kWh forecast) — overnight min SOC {{ min_soc }}% = {{ verdict }}, no adjustment (target stays {{ current_val }}%)
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.battery_learning_last_processed
+        data:
+          value: "{{ decision }}"
+mode: single
